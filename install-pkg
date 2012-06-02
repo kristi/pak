@@ -1,0 +1,188 @@
+#!/bin/bash
+#
+# Build the makepkg script from the pacman source
+# Get the makepkg script from the archlinux repo
+#
+# Since makepkg is just a bash script, we can just extract the file
+#
+
+arch="x86_64"
+mirror="http://mirrors.kernel.org/archlinux"
+prefix="$HOME/local"
+build_dir="$prefix/var/build"
+pak_dir="$prefix/var/pak"
+package_dir="$prefix/var/pak/packages"
+
+MAKEPKG="$prefix/usr/bin/makepkg --config $prefix/etc/makepkg.conf"
+# For downloading abs build files (PKGBUILD and patchfiles)
+SYNCSERVER="rsync.archlinux.org"
+SYNCARGS='-mrtv --no-motd --delete-after --no-p --no-o --no-g'
+
+update_aur_index() {
+    [[ -e "$pak_dir" ]] || mkdir -p "$pak_dir"
+    # Update from file list of the aur git mirror (approx 6 sec)
+    curl -Ss "http://pkgbuild.com/git/aur-mirror.git/plain" | grep '^  <li>' | sed -e 's/<[^>]*>//g' -e 's/^\s*/aur\//' > "$pak_dir/aur_index.txt"
+}
+
+update_abs_index() {
+    [[ -e "$pak_dir" ]] || mkdir -p "$pak_dir"
+    local repo
+    for repo in core extra community
+    do
+        # Rsync lists filenames but not version numbers
+        #rsync "rsync.archlinux.org::abs/x86_64/$repo/" | awk "{print \"$repo/\"\$5}" > "${repo}_index.txt"
+
+        curl -Ss -o "$pak_dir/$repo.db" "$mirror/$repo/os/$arch/$repo.db"
+        tar --exclude="*/*" -tf "$pak_dir/$repo.db" | sed -e 's@/$@@' -e "s@^@$repo/@" > "$pak_dir/${repo}_index.txt"
+    done
+}
+
+update_index() {
+    update_abs_index
+    update_aur_index
+}
+
+# str=$(find_pkg "pacman")
+# #str="core/pacman-4.0.3-1"
+find_pkg() {
+    for repo in core extra community
+    do
+        [[ -e "$pak_dir/${repo}_index.txt" ]] || update_abs_index
+        grep -P "/$1-[^-]*-[0-9]*$" "$pak_dir/${repo}_index.txt"
+    done
+
+    [[ -e "$pak_dir/aur_index.txt" ]] || update_aur_index
+    grep -P "/$1\$" "$pak_dir/aur_index.txt"
+    #tar --exclude="*/*" -tf "$repo.db" | grep "^$1-[^-]*-[0-9]*/$" | sed 's@/$@@'
+    #tar --exclude="*/*" -ztf "$repo.db" | sed -n 's@^\('"$1"'-[^-]*-[0-9]*\)/$@\1@p' 
+    # Use curl to avoid saving the db file
+    #curl -sS "$db_uri" | tar --exclude="*/*" -zt | grep -m 1 "^$1-[^-]*-[0-9]*/$" | sed 's@/$@@'
+}
+
+# BETA!
+# Build makepkg from source
+bootstrap_makepkg_from_source() {
+    entry=$(find_pkg pacman)
+    repo=$(dirname $entry)
+    name=$(basename $entry)
+    tarball="$name.tar.gz"
+    wget "ftp://ftp.archlinux.org/other/pacman/$tarball"
+    tar xf "$tarball"
+    cd "$name"
+    # run configure to generate the makefiles
+    ./configure --sysconfdir=$prefix/etc ac_cv_lib_archive_archive_read_data=yes
+    cd scripts
+    make makepkg
+}
+
+# Extract makefile from the pacman binary
+bootstrap_makepkg_from_repo() {
+    # get latest pacman version
+    entry=$(find_pkg pacman)
+    repo=$(dirname $entry)
+    name=$(basename $entry)
+
+    # Download precompiled pacman binary package
+    pkg="$name-$arch.pkg.tar.xz"
+    [[ -e "$pkg" ]] || wget "$mirror/$repo/os/$arch/$pkg"
+
+    # Extract makepkg
+    tar --strip-components=1 -xf "$pkg" "usr/bin/makepkg" "etc/makepkg.conf"
+
+    sed -i -e '/^BUILDENV/ s/fakeroot/!fakeroot/' makepkg.conf
+    sed -i -e "s@^#PKGDEST=/home/packages@PKGDEST=$package_dir@" makepkg.conf
+    sed -i -e "/^CFLAGS/   s@\"\$@ -I$prefix/usr/include\"@" makepkg.conf
+    sed -i -e "/^CXXFLAGS/ s@\"\$@ -I$prefix/usr/include\"@" makepkg.conf
+    sed -i -e "/^LDFLAGS/  s@\"\$@ -L$prefix/usr/lib -L$prefix/usr/lib64\"@" makepkg.conf
+    # Use tar instead of bsdtar
+    patch -p0 bin/makepkg < makepkg.tar.patch
+
+    sed -i -e "s@^confdir=.*@confdir=$prefix/etc@" bin/makepkg
+    #TODO prompt for packager name & email
+
+    mkdir -p "$package_dir"
+    mkdir -p "$prefix/etc"
+    mkdir -p "$prefix/usr/bin"
+    cp "makepkg.conf" "$prefix/etc/makepkg.conf"
+    cp "bin/makepkg" "$prefix/usr/bin/makepkg"
+}
+
+install_package() {
+    [[ "$1" == "--build-only" ]] && BUILD_ONLY=true
+
+    [[ -e "$build_dir" ]] || mkdir -p "$build_dir"
+
+    for arg in "$@" 
+    do
+        cd "$build_dir"
+        entry=$(find_pkg "$arg")
+        repo=$(dirname "$entry")
+        name=$(basename "$entry")
+        # strip version number
+        name=${name%-*-*}
+        # Download PKGBUILD and build files
+        case "$repo" in
+            core|extra|community)
+                echo rsync $SYNCARGS "$SYNCSERVER::abs/$arch/$repo/$name" .
+                rsync $SYNCARGS "$SYNCSERVER::abs/$arch/$repo/$name" .
+                ;;
+            aur)
+                echo curl "http://aur.archlinux.org/packages/${name:0:2}/$name/$name.tar.gz" | tar -zx
+                curl "http://aur.archlinux.org/packages/${name:0:2}/$name/$name.tar.gz" | tar -zx
+                ;;
+        esac
+
+        cd "$name"
+        $MAKEPKG -f
+
+        [[ "$BUILD_ONLY" == "true" ]] && continue
+
+        package_file="$(get_name_ver_rel)-$arch.pkg.tar.xz"
+
+        tar -C "$prefix" -xf "$package_dir/$package_file"
+    done
+}
+
+get_name_ver_rel {
+    grep -E "^pkgname=|^pkgver=|^pkgrel=" PKGBUILD | awk -F= '{a[$1]=$2}END{OFS="-"; print a["pkgname"],a["pkgver"],a["pkgrel"]}'
+}
+
+bootstrap_install() {
+
+    for arg in "$@" 
+    do
+        build_package $arg
+        tar
+    done
+}
+
+bootstrap_pak() {
+
+    bootstrap_makepkg_from_repo
+    bootstrap_install bzip2 zlib #openssl
+}
+
+clean() {
+    rm -rf "$prefix"
+}
+
+usage() {
+    echo "$(basename $0) Usage:"
+    echo "    TODO (sorry)"
+}
+
+#libarchive pacman
+case "$1" in
+    bootstrap)       bootstrap_pak ;;
+    -h|help|--help)  usage ;;
+    find)            shift; find_pkg "$1" ;;
+    update)          update_index ;;
+    build)           shift; build_package "$1" ;;
+esac
+#update_aur_index
+#update_abs_index
+#find_pkg "pacmanzzz"
+#find_pkg "pacman"
+#find_pkg "bash"
+#find_pkg "xapian-core"
+#find_pkg "yaourt"
